@@ -2,8 +2,24 @@
 
 # offline_install.sh
 # Offline installer for applications in setup_* directories, PLUS Docker images
+# Version: 1.1.0
 
-set -e
+set -euo pipefail
+
+# Show help
+if [[ "${1:-}" =~ ^(-h|--help)$ ]]; then
+    echo "Usage: sudo $(basename "$0")"
+    echo "  Installs .deb packages and loads Docker images from setup_* directories"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help    Show this help message"
+    echo ""
+    echo "The script will:"
+    echo "  1) Scan for setup_* directories in the current folder"
+    echo "  2) Present a menu to select which bundles to install"
+    echo "  3) Install .deb packages and load Docker images"
+    exit 0
+fi
 
 # Ensure the script is run with sudo
 if [[ $EUID -ne 0 ]]; then
@@ -11,12 +27,23 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Enable nullglob so glob returns empty array if no matches
+shopt -s nullglob
+
 # Find all directories matching setup_*
-SETUP_DIRS=(setup_*)
-if [ ${#SETUP_DIRS[@]} -eq 0 ]; then
+SETUP_DIRS=(setup_*/)
+
+# Restore default glob behavior
+shopt -u nullglob
+
+# Check if any directories were found
+if [[ ${#SETUP_DIRS[@]} -eq 0 ]]; then
     echo "❌ No 'setup_*' directories found in $(pwd)."
     exit 1
 fi
+
+# Remove trailing slashes from directory names
+SETUP_DIRS=("${SETUP_DIRS[@]%/}")
 
 # Display the selection menu
 echo "📦 Available setup bundles to install/load:"
@@ -58,18 +85,33 @@ else
     DOCKER_AVAILABLE=false
 fi
 
+# Track installation results
+INSTALL_ERRORS=0
+
 # Process each selected directory
 for DIR in "${SELECTED_DIRS[@]}"; do
     echo
     APP_NAME="${DIR#setup_}"
     echo "🚀 Processing bundle: $APP_NAME"
-    
+
+    # Verify directory exists
+    if [[ ! -d "$DIR" ]]; then
+        echo "   ❌ Directory not found: $DIR"
+        ((INSTALL_ERRORS++)) || true
+        continue
+    fi
+
     # 1) Install any .deb files
     if compgen -G "$DIR"/*.deb > /dev/null; then
         echo "   📦 Installing .deb packages..."
-        dpkg -i "$DIR"/*.deb || true
+        if dpkg -i "$DIR"/*.deb; then
+            echo "   ✓ .deb packages installed successfully"
+        else
+            echo "   ⚠️ Some .deb packages failed to install (dependencies may be resolved later)"
+            ((INSTALL_ERRORS++)) || true
+        fi
     else
-        echo "   ⚠️ No .deb files found in $DIR"
+        echo "   ℹ️ No .deb files found in $DIR"
     fi
 
     # 2) Load any Docker images
@@ -78,7 +120,12 @@ for DIR in "${SELECTED_DIRS[@]}"; do
             echo "   🐳 Loading Docker images..."
             for TAR in "$DIR"/*.tar; do
                 echo "     ↪ docker load -i $(basename "$TAR")"
-                docker load -i "$TAR" || echo "     ⚠️ Failed to load $TAR"
+                if docker load -i "$TAR"; then
+                    echo "     ✓ Loaded successfully"
+                else
+                    echo "     ❌ Failed to load $TAR"
+                    ((INSTALL_ERRORS++)) || true
+                fi
             done
         else
             echo "   ⚠️ Docker CLI not found—skipping Docker images in $DIR"
@@ -91,9 +138,16 @@ done
 # Fix dependencies (offline-safe)
 echo
 echo "🔧 Fixing package dependencies (offline-safe)..."
-apt-get install -f -y --no-download || {
+if apt-get install -f -y --no-download; then
+    echo "✓ Dependencies resolved successfully"
+else
     echo "⚠️ Some dependencies may be missing. Ensure all .deb files are present."
-}
+    ((INSTALL_ERRORS++)) || true
+fi
 
 echo
-echo "✅ All done!"
+if [[ $INSTALL_ERRORS -eq 0 ]]; then
+    echo "✅ All done! Installation completed successfully."
+else
+    echo "⚠️ Completed with $INSTALL_ERRORS error(s). Review messages above for details."
+fi
