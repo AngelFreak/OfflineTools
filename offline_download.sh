@@ -2,8 +2,23 @@
 
 # offline_download.sh
 # 🚀 Offline downloader for .deb packages OR Docker images (with virtual-package & URI fallback)
+# Version: 1.1.0
 
-set -e
+set -euo pipefail
+
+# Show help
+if [[ "${1:-}" =~ ^(-h|--help)$ ]]; then
+    echo "Usage: $(basename "$0")"
+    echo "  Downloads .deb packages or Docker images for offline installation"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help    Show this help message"
+    echo ""
+    echo "The script will prompt you to choose between:"
+    echo "  1) Downloading .deb packages with all dependencies"
+    echo "  2) Downloading Docker images as .tar archives"
+    exit 0
+fi
 
 # Record real user (for chown)
 ORIG_UID=$(id -u)
@@ -12,6 +27,18 @@ ORIG_GID=$(id -g)
 # 1) Where is this script? (USB mount)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+# Temp folder variable (set later, used by cleanup)
+LOCAL_FOLDER=""
+
+# Cleanup function for error handling
+cleanup() {
+    if [[ -n "$LOCAL_FOLDER" && -d "$LOCAL_FOLDER" ]]; then
+        rm -rf "$LOCAL_FOLDER" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'echo ""; echo "⚠️ Interrupted. Cleaning up..."; exit 130' INT TERM
 
 # 2) Verify required tools
 echo "🔧 Checking for apt-rdepends…"
@@ -50,7 +77,20 @@ if [ "$WANT_DEB" = true ]; then
   echo "📦 Package Downloader"
   read -p "👉 Enter package names (space- or comma-separated): " pkg_in
   [[ -n "$pkg_in" ]] || { echo "❌ No packages entered. Exiting."; exit 1; }
-  PACKAGES=( $(echo "$pkg_in" | tr ',' ' ' | xargs) )
+
+  # Safely parse package names into array (avoid word splitting issues)
+  PACKAGES=()
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] && PACKAGES+=("$pkg")
+  done < <(echo "$pkg_in" | tr ',' '\n' | tr ' ' '\n' | xargs -n1 2>/dev/null)
+
+  # Validate package names
+  for pkg in "${PACKAGES[@]}"; do
+    if [[ ! "$pkg" =~ ^[a-zA-Z0-9._:+-]+$ ]]; then
+      echo "❌ Invalid package name: $pkg"
+      exit 1
+    fi
+  done
 
   echo
   echo "🔄 Updating apt cache…"
@@ -58,10 +98,13 @@ if [ "$WANT_DEB" = true ]; then
 
   echo
   echo "🔍 Resolving dependencies…"
-  deps=$(apt-rdepends "${PACKAGES[@]}" 2>/dev/null \
-         | grep -Ev '^\s|^<|^PreDepends:' \
-         | sort -u)
-  ALL_DEBS=( "${PACKAGES[@]}" $deps )
+  # Safely read dependencies into array
+  ALL_DEBS=("${PACKAGES[@]}")
+  while IFS= read -r dep; do
+    [[ -n "$dep" ]] && ALL_DEBS+=("$dep")
+  done < <(apt-rdepends "${PACKAGES[@]}" 2>/dev/null \
+           | grep -Ev '^\s|^<|^PreDepends:' \
+           | sort -u)
 
   echo
   echo "📋 Will attempt to download these packages:"
@@ -70,7 +113,6 @@ if [ "$WANT_DEB" = true ]; then
   read -p "❓ Proceed? [y/N] " yn
   if [[ ! "$yn" =~ ^[Yy]$ ]]; then
     echo "🚫 .deb download cancelled."
-    rm -rf "$LOCAL_FOLDER"
     exit 0
   fi
 
@@ -126,28 +168,37 @@ if [ "$WANT_DOCKER" = true ]; then
   echo
   if ! command -v docker &>/dev/null; then
     echo "⚠️  Docker CLI not found—exiting."
-    rm -rf "$LOCAL_FOLDER"
     exit 1
   fi
 
+  # Use array for docker command to handle sudo properly
+  DOCKER_CMD=(docker)
   if ! docker info &>/dev/null; then
-    DOCKER_CMD="sudo docker"
+    DOCKER_CMD=(sudo docker)
     echo "🔐 Will use sudo for Docker commands."
-  else
-    DOCKER_CMD="docker"
   fi
 
   echo
   echo "🐳 Docker Image Downloader"
   read -p "👉 Enter Docker image names (space- or comma-separated): " img_in
-  [[ -n "$img_in" ]] || { echo "❌ No images entered. Exiting."; rm -rf "$LOCAL_FOLDER"; exit 1; }
-  IMAGES=( $(echo "$img_in" | tr ',' ' ' | xargs) )
+  [[ -n "$img_in" ]] || { echo "❌ No images entered. Exiting."; exit 1; }
+
+  # Safely parse image names into array (avoid word splitting issues)
+  IMAGES=()
+  while IFS= read -r img; do
+    [[ -n "$img" ]] && IMAGES+=("$img")
+  done < <(echo "$img_in" | tr ',' '\n' | tr ' ' '\n' | xargs -n1 2>/dev/null)
+
+  if [[ ${#IMAGES[@]} -eq 0 ]]; then
+    echo "❌ No valid images entered. Exiting."
+    exit 1
+  fi
 
   echo
   echo "⬇️  Pulling Docker images…"
   for img in "${IMAGES[@]}"; do
     echo "   • $img"
-    $DOCKER_CMD pull "$img" \
+    "${DOCKER_CMD[@]}" pull "$img" \
       || { echo "     ❌ Failed to pull $img"; exit 1; }
   done
 
@@ -156,7 +207,7 @@ if [ "$WANT_DOCKER" = true ]; then
 
   echo
   echo "📦 Saving all images into: $TAR_FILE"
-  $DOCKER_CMD save --output "$LOCAL_FOLDER/$TAR_FILE" "${IMAGES[@]}" \
+  "${DOCKER_CMD[@]}" save --output "$LOCAL_FOLDER/$TAR_FILE" "${IMAGES[@]}" \
     || { echo "❌ Failed to save images"; exit 1; }
 
   echo "🔄 Restoring ownership on $TAR_FILE"
@@ -171,27 +222,38 @@ if [ "$WANT_DOCKER" = true ]; then
   SAFE_IMG=$(printf "%s_" "${IMAGES[@]}" | tr -cd '[:alnum:]_' );   SAFE_IMG=${SAFE_IMG%_}
 fi
 
-if [ -n "$SAFE_DEB" ]; then
+if [ -n "${SAFE_DEB:-}" ]; then
   DIR_NAME="setup_${SAFE_DEB}"
-elif [ -n "$SAFE_IMG" ]; then
+elif [ -n "${SAFE_IMG:-}" ]; then
   DIR_NAME="setup_docker_${SAFE_IMG}"
 else
   echo "❌ Nothing to move. Exiting."
-  rm -rf "$LOCAL_FOLDER"
   exit 1
 fi
 
 DEST="$SCRIPT_DIR/$DIR_NAME"
 
-# 8) Move downloads to USB
+# 8) Check if destination exists and warn about overwriting
+if [[ -d "$DEST" ]]; then
+  echo
+  echo "⚠️  Directory already exists: $DEST"
+  read -p "❓ Overwrite existing files? [y/N] " overwrite
+  if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+    echo "🚫 Operation cancelled."
+    exit 0
+  fi
+fi
+
+# 9) Move downloads to USB
 echo
 echo "📂 Moving downloads to: $DEST"
 mkdir -p "$DEST"
 mv "$LOCAL_FOLDER"/*.deb "$DEST/" 2>/dev/null || true
 mv "$LOCAL_FOLDER"/*.tar "$DEST/" 2>/dev/null || true
 
-# 9) Cleanup
-rm -rf "$LOCAL_FOLDER"
+# 10) Cleanup (also handled by trap, but explicit for clarity)
+rm -rf "$LOCAL_FOLDER" 2>/dev/null || true
+LOCAL_FOLDER=""  # Prevent trap from trying to clean again
 
 echo
 echo "✅ Download complete!"
